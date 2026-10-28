@@ -150,11 +150,13 @@ def packed_nccl_broadcast_producer(
     post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
+    synchronize: Callable[[Any], None] | None = None,
 ) -> None:
     """Broadcast tensors in a packed manner from trainer to workers.
 
     Args:
         iterator: Iterator of model parameters. Returns a tuple of (name, tensor)
+        synchronize: Optional error-aware completion wait for recoverable NCCL.
         group: Process group (PyNcclCommunicator)
         src: Source rank (0 in current implementation)
         post_iter_func: Function to apply to each (name, tensor) pair before
@@ -165,6 +167,7 @@ def packed_nccl_broadcast_producer(
                     Both producer and consumer must use the same value.
 
     """
+    wait = synchronize or (lambda completion: completion.synchronize())
     streams = _get_streams(torch.accelerator.current_device_index(), num_buffers)
     # Keep references to in-flight chunks so their packed_tensors
     # aren't freed while an async broadcast is still reading them.
@@ -173,7 +176,7 @@ def packed_nccl_broadcast_producer(
 
     while True:
         # Synchronize the current stream
-        streams[buffer_idx].synchronize()
+        wait(streams[buffer_idx])
         # Previous chunk on this buffer slot is now safe to free
         in_flight[buffer_idx] = None
         # Start tasks for the new buffer in a new stream
@@ -190,7 +193,7 @@ def packed_nccl_broadcast_producer(
 
     # Drain every slot before returning.
     for stream in streams:
-        stream.synchronize()
+        wait(stream)
 
 
 def packed_nccl_broadcast_consumer(
@@ -201,11 +204,13 @@ def packed_nccl_broadcast_consumer(
     buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
     num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
     device: torch.device | str = "cuda",
+    synchronize: Callable[[Any], None] | None = None,
 ) -> None:
     """Consume packed tensors and unpack them into a list of tensors.
 
     Args:
         iterator: Iterator of parameter metadata. Returns (name, (shape, dtype))
+        synchronize: Optional error-aware completion wait for recoverable NCCL.
         group: Process group (PyNcclCommunicator)
         src: Source rank (0 in current implementation)
         post_unpack_func: Function to apply to each list of (name, tensor) after
@@ -220,6 +225,7 @@ def packed_nccl_broadcast_consumer(
     """
     target_packed_tensor_size = buffer_size_bytes
 
+    wait = synchronize or (lambda completion: completion.synchronize())
     streams = _get_streams(torch.accelerator.current_device_index(), num_buffers)
     buffer_idx = 0
 
@@ -237,6 +243,10 @@ def packed_nccl_broadcast_consumer(
             packing_tensor_sizes[buffer_idx], dtype=torch.uint8, device=device
         )
         group.broadcast(packed, src=src)
+        if synchronize is not None:
+            # A loader may read a received tensor on the CPU. Detect peer
+            # failure before such a read enters an uninterruptible CUDA wait.
+            synchronize(streams[buffer_idx])
 
         # post_unpack_func may keep the unpacked views and read them from a later
         # pack's callback, on another slot stream. Chaining the ready events
@@ -261,12 +271,12 @@ def packed_nccl_broadcast_consumer(
         slot_done[buffer_idx] = event
 
     while True:
-        # Wait for this slot's previous pack. Not streams[buffer_idx].synchronize():
+        # Wait for this slot's previous pack. Not wait(streams[buffer_idx]):
         # on ROCm, streams can share a hardware queue, and synchronizing one
         # stream then also waits for work queued later on the others.
         done = slot_done[buffer_idx]
         if done is not None:
-            done.synchronize()
+            wait(done)
         with torch.cuda.stream(streams[buffer_idx]):
             # Initialize the packing tensor meta data
             packing_tensor_meta_data[buffer_idx] = []
@@ -293,7 +303,7 @@ def packed_nccl_broadcast_consumer(
 
     # Drain every slot before returning.
     for stream in streams:
-        stream.synchronize()
+        wait(stream)
 
 
 # ── IPC packed transfer ────────────────────────────────────────────────

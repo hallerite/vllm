@@ -8,11 +8,12 @@ The dense (`NCCLWeightTransferEngine`) and sparse
 sparse engine does not have to subclass the dense one.
 """
 
+import math
 import socket
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, overload
 
 import pybase64 as base64
 import torch
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
     from vllm.config.parallel import ParallelConfig
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
+    from vllm.distributed.weight_transfer.nccl_communicator import (
+        NCCLWeightTransferCommunicator,
+    )
 
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     NCCL_UNIQUE_ID_BYTES,
@@ -197,7 +201,9 @@ def stateless_init_process_group(
     rank: int,
     world_size: int,
     device,
-) -> "PyNcclCommunicator":
+    *,
+    timeout: float | None = None,
+) -> "PyNcclCommunicator | NCCLWeightTransferCommunicator":
     """VLLM provides `StatelessProcessGroup` to create a process group
     without considering the global process group in torch.distributed.
     It is recommended to create `StatelessProcessGroup`, and then initialize
@@ -208,9 +214,27 @@ def stateless_init_process_group(
     from vllm.distributed.utils import StatelessProcessGroup
 
     pg = StatelessProcessGroup.create(
-        host=master_address, port=master_port, rank=rank, world_size=world_size
+        host=master_address,
+        port=master_port,
+        rank=rank,
+        world_size=world_size,
+        store_timeout=300 if timeout is None else math.ceil(timeout),
     )
     with unpinned_nccl_env():
+        if timeout is not None:
+            from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+            from vllm.distributed.weight_transfer.nccl_communicator import (
+                NCCLWeightTransferCommunicator,
+            )
+
+            unique_id = pg.broadcast_obj(
+                NCCLLibrary().ncclGetUniqueId() if rank == 0 else None, src=0
+            )
+            comm = NCCLWeightTransferCommunicator(
+                unique_id, rank, world_size, device, timeout
+            )
+            comm.group = pg
+            return comm
         return PyNcclCommunicator(pg, device=device)
 
 
@@ -219,7 +243,9 @@ def uid_init_process_group(
     rank: int,
     world_size: int,
     device,
-) -> "PyNcclCommunicator":
+    *,
+    timeout: float | None = None,
+) -> "PyNcclCommunicator | NCCLWeightTransferCommunicator":
     """Join the NCCL group from pre-shared ``ncclUniqueId`` bytes.
 
     The torch-free rendezvous alternative to `stateless_init_process_group`: no
@@ -228,6 +254,19 @@ def uid_init_process_group(
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     with unpinned_nccl_env():
+        if timeout is not None:
+            from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+            from vllm.distributed.weight_transfer.nccl_communicator import (
+                NCCLWeightTransferCommunicator,
+            )
+
+            return NCCLWeightTransferCommunicator(
+                NCCLLibrary().unique_id_from_bytes(nccl_unique_id_bytes),
+                rank,
+                world_size,
+                device,
+                timeout,
+            )
         return PyNcclCommunicator.from_unique_id_bytes(
             nccl_unique_id_bytes,
             rank=rank,
@@ -259,10 +298,30 @@ def worker_init_metadata_group(
     )
 
 
+@overload
 def worker_init_process_group(
     init_info: NCCLWeightTransferInitInfo,
     parallel_config: "ParallelConfig",
-) -> "PyNcclCommunicator":
+    *,
+    timeout: None = None,
+) -> "PyNcclCommunicator": ...
+
+
+@overload
+def worker_init_process_group(
+    init_info: NCCLWeightTransferInitInfo,
+    parallel_config: "ParallelConfig",
+    *,
+    timeout: float,
+) -> "NCCLWeightTransferCommunicator": ...
+
+
+def worker_init_process_group(
+    init_info: NCCLWeightTransferInitInfo,
+    parallel_config: "ParallelConfig",
+    *,
+    timeout: float | None = None,
+) -> "PyNcclCommunicator | NCCLWeightTransferCommunicator":
     """Create the trainer<->worker NCCL group on an inference worker.
 
     Computes a unique rank for this worker across all data-parallel groups and
@@ -278,6 +337,7 @@ def worker_init_process_group(
             rank,
             init_info.world_size,
             device,
+            timeout=timeout,
         )
     # __post_init__ guarantees the TCP pair when there is no unique id.
     assert init_info.master_address is not None
@@ -288,13 +348,34 @@ def worker_init_process_group(
         rank,
         init_info.world_size,
         device=device,
+        timeout=timeout,
     )
+
+
+@overload
+def trainer_init(
+    init_info: NCCLRendezvous | dict,
+    rank: int = 0,
+    *,
+    timeout: None = None,
+) -> "PyNcclCommunicator": ...
+
+
+@overload
+def trainer_init(
+    init_info: NCCLRendezvous | dict,
+    rank: int = 0,
+    *,
+    timeout: float,
+) -> "NCCLWeightTransferCommunicator": ...
 
 
 def trainer_init(
     init_info: NCCLRendezvous | dict,
     rank: int = 0,
-) -> "PyNcclCommunicator":
+    *,
+    timeout: float | None = None,
+) -> "PyNcclCommunicator | NCCLWeightTransferCommunicator":
     """Initialize NCCL process group for trainer-side weight transfer.
 
     Uses the current CUDA device (torch.accelerator.current_device_index()).
@@ -305,6 +386,7 @@ def trainer_init(
             - master_address: str
             - master_port: int
             - world_size: int
+        timeout: Optional recoverable NCCL wait timeout in seconds.
         rank: This trainer process's rank in the group. Trainer ranks occupy
             `[0, num_trainer_ranks)` and the workers start after them.
 
@@ -328,4 +410,5 @@ def trainer_init(
         rank,
         world_size,
         device,
+        timeout=timeout,
     )

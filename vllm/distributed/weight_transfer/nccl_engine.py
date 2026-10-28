@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based (dense) weight transfer engine."""
 
+import math
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -12,6 +13,9 @@ import torch
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.weight_transfer.nccl_communicator import (
+        NCCLWeightTransferCommunicator,
+    )
 
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.distributed.weight_transfer.base import (
@@ -24,7 +28,9 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferUpdateInfo,
 )
 from vllm.distributed.weight_transfer.nccl_common import (
-    NCCLWeightTransferInitInfo,
+    NCCLWeightTransferInitInfo as _NCCLWeightTransferInitInfo,
+)
+from vllm.distributed.weight_transfer.nccl_common import (
     build_worker_init_payload,
     run_trainer_rendezvous,
     worker_init_process_group,
@@ -39,8 +45,7 @@ from vllm.distributed.weight_transfer.packed_tensor import (
     packed_nccl_broadcast_producer,
 )
 
-# NCCLWeightTransferInitInfo is re-exported here for convenience; its canonical
-# home is nccl_common, shared with the sparse backend.
+# Dense recovery is opt-in; sparse NCCL keeps its existing initialization.
 __all__ = [
     "NCCLWeightTransferInitInfo",
     "NCCLTrainerInitInfo",
@@ -48,6 +53,20 @@ __all__ = [
     "NCCLWeightTransferEngine",
     "NCCLTrainerWeightTransferEngine",
 ]
+
+
+@dataclass(kw_only=True)
+class NCCLWeightTransferInitInfo(_NCCLWeightTransferInitInfo):
+    operation_timeout: float | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_timeout(self.operation_timeout)
+
+
+def _validate_timeout(timeout: float | None) -> None:
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError("operation_timeout must be finite and positive")
 
 
 @dataclass
@@ -80,6 +99,10 @@ class NCCLTrainerInitInfo(TrainerInitInfo):
     packed: bool = True
     packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
     packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
+    operation_timeout: float | None = None
+
+    def __post_init__(self) -> None:
+        _validate_timeout(self.operation_timeout)
 
 
 @dataclass
@@ -133,7 +156,9 @@ class NCCLWeightTransferEngine(
         model: torch.nn.Module,
     ) -> None:
         super().__init__(config, vllm_config, device, model)
-        self.model_update_group: PyNcclCommunicator | None = None
+        self.model_update_group: (
+            PyNcclCommunicator | NCCLWeightTransferCommunicator | None
+        ) = None
         # Set from the trainer-supplied init info at the handshake; defaults are
         # only for the (unreachable) receive-before-init case.
         self.rank_offset = 1
@@ -161,7 +186,13 @@ class NCCLWeightTransferEngine(
         self.packed_num_buffers = init_info.packed_num_buffers
         self._last_update_info.clear()
         self.model_update_group = worker_init_process_group(
-            init_info, self.parallel_config
+            init_info,
+            self.parallel_config,
+            **(
+                {"timeout": init_info.operation_timeout}
+                if init_info.operation_timeout is not None
+                else {}
+            ),
         )
 
     def start_weight_update(self) -> None:
@@ -232,6 +263,7 @@ class NCCLWeightTransferEngine(
                     buffer_size_bytes=self.packed_buffer_size_bytes,
                     num_buffers=self.packed_num_buffers,
                     device=self.device,
+                    synchronize=_recovery_wait(self.model_update_group),
                 )
             else:
                 # Use simple one-by-one broadcasting
@@ -243,6 +275,9 @@ class NCCLWeightTransferEngine(
                     self.model_update_group.broadcast(
                         weight, src=src, stream=torch.cuda.current_stream()
                     )
+                    wait = _recovery_wait(self.model_update_group)
+                    if wait is not None:
+                        wait(torch.cuda.current_stream())
                     self.model.load_weights([(name, weight)])
                     del weight
 
@@ -283,7 +318,9 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         self.packed = packed
         self.packed_buffer_size_bytes = packed_buffer_size_bytes
         self.packed_num_buffers = packed_num_buffers
-        self.model_update_group: PyNcclCommunicator | None = None
+        self.model_update_group: (
+            PyNcclCommunicator | NCCLWeightTransferCommunicator | None
+        ) = None
         # This rank's rank in the transfer group, set by trainer_init.
         self._group_rank = 0
         # Metadata the worker already holds; an unchanged round sends none.
@@ -291,15 +328,27 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
 
     @classmethod
     def _build_worker_init_payload(cls, init_info: NCCLTrainerInitInfo) -> dict:
-        return build_worker_init_payload(
+        payload = build_worker_init_payload(
             init_info,
             packed=init_info.packed,
             packed_buffer_size_bytes=init_info.packed_buffer_size_bytes,
             packed_num_buffers=init_info.packed_num_buffers,
         )
 
+        if init_info.operation_timeout is not None:
+            payload["operation_timeout"] = init_info.operation_timeout
+        return payload
+
     def _open_trainer_endpoint(self, init_info: NCCLTrainerInitInfo) -> None:
-        self.model_update_group = open_trainer_endpoint(init_info, self._group_rank)
+        self.model_update_group = open_trainer_endpoint(
+            init_info,
+            self._group_rank,
+            **(
+                {"timeout": init_info.operation_timeout}
+                if init_info.operation_timeout is not None
+                else {}
+            ),
+        )
 
     @staticmethod
     def _broadcast_plan(
@@ -477,6 +526,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
                 post_iter_func=lambda item: item[1],
                 buffer_size_bytes=self.packed_buffer_size_bytes,
                 num_buffers=self.packed_num_buffers,
+                synchronize=_recovery_wait(self.model_update_group),
             )
         else:
             stream = torch.cuda.current_stream()
@@ -500,6 +550,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
                 post_unpack_func=lambda weights: None,
                 buffer_size_bytes=self.packed_buffer_size_bytes,
                 num_buffers=self.packed_num_buffers,
+                synchronize=_recovery_wait(self.model_update_group),
                 device=device,
             )
         else:
@@ -568,9 +619,24 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         otherwise does not have.
         """
         if torch.accelerator.is_available():
-            torch.accelerator.current_stream().synchronize()
+            stream = torch.accelerator.current_stream()
+            wait = _recovery_wait(self.model_update_group)
+            if wait is None:
+                stream.synchronize()
+            else:
+                wait(stream)
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:
             self.model_update_group.destroy()
             self.model_update_group = None
+
+
+def _recovery_wait(group):
+    from vllm.distributed.weight_transfer.nccl_communicator import (
+        NCCLWeightTransferCommunicator,
+    )
+
+    return (
+        group.synchronize if isinstance(group, NCCLWeightTransferCommunicator) else None
+    )

@@ -2837,3 +2837,162 @@ def test_plugin_does_not_replace_native_backend(mx_client):
     register_plugin_weight_transfer_engine()
     assert WeightTransferEngineFactory._registry["modelexpress"] is native_loader
     assert type(_make_modelexpress_engine()) is ModelExpressWeightTransferEngine
+
+
+def _recovery_connect(unique_id, rank):
+    from vllm.distributed.weight_transfer.nccl_common import uid_init_process_group
+
+    torch.accelerator.set_device_index(rank)
+    torch.cuda.set_per_process_memory_fraction(0.08, rank)
+    return uid_init_process_group(unique_id, rank, 2, rank, timeout=5)
+
+
+def _recovery_transfer(comm, packed, value=None):
+    from vllm.distributed.weight_transfer.packed_tensor import (
+        packed_nccl_broadcast_consumer,
+        packed_nccl_broadcast_producer,
+    )
+
+    shape = (1024,)
+    if not packed:
+        tensor = torch.full(shape, value or 0.0, device=comm.device)
+        comm.broadcast(tensor, 0)
+        comm.synchronize(torch.cuda.current_stream())
+        return tensor
+    if value is not None:
+        packed_nccl_broadcast_producer(
+            iter([("weight", torch.full(shape, value, device=comm.device))]),
+            comm,
+            0,
+            lambda item: item[1],
+            buffer_size_bytes=1024,
+            synchronize=comm.synchronize,
+        )
+        return None
+    received = []
+    packed_nccl_broadcast_consumer(
+        iter([("weight", (list(shape), torch.float32))]),
+        comm,
+        0,
+        lambda weights: received.extend(weights),
+        buffer_size_bytes=1024,
+        device=comm.device,
+        synchronize=comm.synchronize,
+    )
+    return received[0][1]
+
+
+def _recovery_sender(pipe, unique_id, failure, packed):
+    pipe.send("ready")
+    pipe.recv()
+    comm = _recovery_connect(unique_id, 0)
+    _recovery_transfer(comm, packed, 23.0)
+    pipe.send("sent")
+    if failure:
+        pipe.recv()
+    _recovery_transfer(comm, packed, 42.0)
+    pipe.send("complete")
+    pipe.recv()
+    comm.destroy()
+
+
+def _recovery_receiver(pipe, packed):
+    import os
+
+    pipe.send("ready")
+    for _ in range(2):
+        unique_id, failure = pipe.recv()
+        if failure == "initialization":
+            with pytest.raises(TimeoutError, match="NCCL"):
+                _recovery_connect(unique_id, 1)
+            pipe.send("failed")
+        else:
+            comm = _recovery_connect(unique_id, 1)
+            assert torch.all(_recovery_transfer(comm, packed) == 23).item()
+            pipe.send(("received", os.getpid()))
+            try:
+                tensor = _recovery_transfer(comm, packed)
+            except (TimeoutError, RuntimeError) as error:
+                assert failure and "NCCL" in str(error)
+                pipe.send("failed")
+                with pytest.raises(RuntimeError, match="closed"):
+                    comm.synchronize(torch.cuda.current_stream())
+            else:
+                assert not failure
+                assert torch.all(tensor == 42).item()
+                pipe.send(("recovered", os.getpid()))
+            comm.destroy()
+            comm.destroy()
+        matrix = torch.ones((32, 32), device="cuda:1")
+        assert torch.all(matrix @ matrix == 32).item()
+        pipe.send("cuda_healthy")
+
+
+def _recovery_recv(pipe):
+    assert pipe.poll(60), "recovery process did not respond"
+    return pipe.recv()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or torch.accelerator.device_count() < 2,
+    reason="Requires two NVIDIA GPUs",
+)
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("failure", ["killed", "stalled", "initialization"])
+def test_nccl_weight_transfer_recovers_after_peer_failure(monkeypatch, packed, failure):
+    """A receiver survives a lost sender and receives exact replacement bytes."""
+    import multiprocessing as mp
+    import os
+    import signal
+
+    from vllm.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "1")
+    monkeypatch.setenv("NCCL_SHM_DISABLE", "1")
+    ctx = mp.get_context("spawn")
+    parent, child = ctx.Pipe()
+    receiver = ctx.Process(target=_recovery_receiver, args=(child, packed))
+    processes = [receiver]
+    receiver.start()
+    try:
+        assert _recovery_recv(parent) == "ready"
+        for fault in (failure, None):
+            unique_id = bytes(NCCLLibrary().ncclGetUniqueId())
+            if fault == "initialization":
+                parent.send((unique_id, fault))
+                assert _recovery_recv(parent) == "failed"
+            else:
+                sender_pipe, sender_child = ctx.Pipe()
+                sender = ctx.Process(
+                    target=_recovery_sender,
+                    args=(sender_child, unique_id, fault, packed),
+                )
+                processes.append(sender)
+                sender.start()
+                assert _recovery_recv(sender_pipe) == "ready"
+                parent.send((unique_id, fault))
+                sender_pipe.send("connect")
+                assert _recovery_recv(sender_pipe) == "sent"
+                assert _recovery_recv(parent) == ("received", receiver.pid)
+                if fault:
+                    os.kill(
+                        sender.pid,
+                        signal.SIGKILL if fault == "killed" else signal.SIGSTOP,
+                    )
+                    assert _recovery_recv(parent) == "failed"
+                    sender.kill()
+                else:
+                    assert _recovery_recv(sender_pipe) == "complete"
+                    assert _recovery_recv(parent) == ("recovered", receiver.pid)
+                    sender_pipe.send("close")
+                sender.join(10)
+                if not fault:
+                    assert sender.exitcode == 0
+            assert _recovery_recv(parent) == "cuda_healthy"
+        receiver.join(10)
+        assert receiver.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+            process.join(10)

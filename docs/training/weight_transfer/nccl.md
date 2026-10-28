@@ -85,6 +85,7 @@ once every transfer has drained.
 | `packed` | `True` | Use packed broadcasting |
 | `packed_buffer_size_bytes` | 1 GiB | Packed buffer size |
 | `packed_num_buffers` | 2 | Number of rotating buffers (double/triple buffering) |
+| `operation_timeout` | `None` | Opt into recoverable dense NCCL waits, in seconds; must be finite and positive |
 
 `packed` defaults to `True` here. The worker-side default is `False`, but it only
 applies when no trainer ships a value — which, on this path, never happens.
@@ -149,7 +150,7 @@ must declare `owners`. Rank 0 is always in the transfer group and only gathers
 in its own turn, so if it owns a parameter it must be that parameter's first
 owner. `trainer_init` raises on every rank otherwise.
 
-A failure on any broadcaster during an update is fatal for the transfer. That
+Without `operation_timeout`, a failure on any broadcaster during an update is fatal for the transfer. That
 rank raises immediately, but the other trainer ranks and the inference workers
 can stay blocked in that update's broadcasts, so tear down the trainer job and
 restart or re-initialize the inference engine before transferring again.
@@ -208,7 +209,8 @@ rank 0. Reference: [`rlhf_http_nccl_no_vllm.py`](../../../examples/rl/rlhf_http_
 - Worker rank = `rank_offset + dp_index * (TP * PP) + rank`.
 - `/init_weight_transfer_engine` returns only after all ranks join: send it in
   the background while the trainer calls `ncclCommInitRank(world_size, uid, 0)`.
-  There is no timeout; if the trainer never joins, the workers wait forever.
+  By default there is no timeout; if the trainer never joins, the workers wait forever.
+  Dense NCCL workers also accept `operation_timeout` to bound NCCL waits.
 - Right after init every worker issues a warm-up `all_reduce` (sum) of
   `torch.zeros(1)` (one float32 element). The trainer must issue the same one
   before any other collective.
@@ -301,9 +303,37 @@ Sparse NCCL sends only `O(nnz)` indices and values. Checkpoint application still
 
 [`rlhf_sparse_nccl.py`](../../../examples/rl/rlhf_sparse_nccl.py) demonstrates per-expert checkpoint patches with a Qwen3 MoE TP2/EP2 engine.
 
+## Recoverable dense NCCL waits
+
+Set `NCCLTrainerInitInfo(operation_timeout=30)` to use a nonblocking NCCL
+communicator on the trainer and every inference worker. This is CUDA-only and
+opt-in. Leave `NCCL_COMM_BLOCKING` unset (or set it to `0`); a value of `1`
+overrides the nonblocking communicator configuration and is rejected.
+
+The timeout applies separately to rendezvous, NCCL initialization, and each
+launch or completion wait. It is not a total update deadline. A peer error or
+expired NCCL wait aborts that communicator on the thread issuing the calls and
+raises an exception. NCCL abort/driver cleanup is not a hard real-time deadline.
+Inference's tensor-parallel communicators are unaffected.
+
+Packed transfers keep their rotating buffers. Recovery mode polls completion
+before handing a received pack to the loader, since a loader can read a tensor
+on the CPU. This introduces an additional synchronization boundary and can
+reduce transfer/loading overlap; benchmark it on the deployment's interconnect.
+
+This option recovers the **transport**, not an interrupted model update. Keep
+inference paused after failure. Release the old transfer engine, reinitialize
+all participating ranks together with a fresh rendezvous, and send fresh
+metadata. A partial model update requires reload-state cleanup and a complete
+replacement weight update before generation can resume; if that cleanup is
+unavailable, restart inference. Do not resume with partially updated weights.
+The caller still owns pause/resume, selecting the replacement trainer, and
+rejecting stale publishers. A failure in a separate trainer collective (such
+as FSDP parameter gathering) is outside this communicator's scope.
+
 ## Limitations
 
-- **A broadcaster failure is fatal.** See
+- **A broadcaster failure invalidates the transfer.** See
   [Broadcasting ranks](#broadcasting-ranks).
 - **Full tensors on the wire.** Each broadcaster materializes its parameters in full and
   every worker receives all of it, whatever its tensor-parallel shard. For
